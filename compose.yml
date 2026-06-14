@@ -1,0 +1,155 @@
+name: fortrx
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    env_file:
+      - ${FORTRX_ENV_FILE:-.env.runtime}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    env_file:
+      - ${FORTRX_ENV_FILE:-.env.runtime}
+    command:
+      - server
+      - /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  fortrx:
+    build: .
+    image: ${FORTRX_IMAGE:-fortrx-server:latest}
+    restart: unless-stopped
+    env_file:
+      - ${FORTRX_ENV_FILE:-.env.runtime}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command:
+      - sh
+      - -lc
+      - ${FORTRX_COMMAND:-./start.sh}
+    networks:
+      - internal
+      - web
+    expose:
+      - "8000"
+    volumes:
+      - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini:ro
+      - ./alembic:/app/alembic:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  caddy:
+    profiles: ["prod"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      fortrx:
+        condition: service_healthy
+    env_file:
+      - ${FORTRX_ENV_FILE:-.env.runtime}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./ops/host/logs:/var/log/fortrx
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - web
+
+  duckdns:
+    profiles: ["prod"]
+    image: alpine:3.20
+    restart: unless-stopped
+    env_file:
+      - ${FORTRX_ENV_FILE:-.env.runtime}
+    command: >
+      sh -c "apk add --no-cache curl >/dev/null &&
+      while true; do
+        curl -fsS \"https://www.duckdns.org/update?domains=$${DUCKDNS_DOMAIN}&token=$${DUCKDNS_TOKEN}&ip=\";
+        sleep 300;
+      done"
+    networks:
+      - web
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
+    internal: true
+  web:
